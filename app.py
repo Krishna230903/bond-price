@@ -132,22 +132,41 @@ def create_pdf(data):
 # ==========================================
 st.set_page_config(page_title="Fixed Income Analytics", layout="wide")
 
-# Professional CSS
+# BLUE THEME CSS
 st.markdown("""
 <style>
-    .stApp {background-color: #ffffff; color: #333333;}
-    h1, h2, h3 {font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #2c3e50;}
-    .stMetric {background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 4px;}
-    div[data-testid="stMetricValue"] {font-size: 24px; color: #2c3e50;}
-    div[data-testid="stMetricLabel"] {font-size: 14px; color: #6c757d;}
+    /* Main Background - Deep Navy */
+    .stApp {background-color: #0c1829; color: #e6f1ff;}
+    
+    /* Headers - Light Blue */
+    h1, h2, h3 {font-family: 'Helvetica Neue', sans-serif; color: #64b5f6 !important;}
+    
+    /* Metrics - Darker Blue Cards */
+    .stMetric {background-color: #16263b !important; border: 1px solid #2c4a70 !important; border-radius: 4px;}
+    div[data-testid="stMetricValue"] {font-size: 24px; color: #64b5f6 !important;}
+    div[data-testid="stMetricLabel"] {font-size: 14px; color: #b0bec5 !important;}
+    
+    /* Tabs */
+    button[data-baseweb="tab"] {color: #b0bec5; font-weight: bold;}
+    button[data-baseweb="tab"][aria-selected="true"] {color: #64b5f6; border-bottom-color: #64b5f6;}
+    
+    /* Inputs */
+    .stTextInput>div>div>input {color: white; background-color: #16263b;}
+    .stNumberInput>div>div>input {color: white; background-color: #16263b;}
+    
+    /* Dataframes */
+    .stDataFrame {border: 1px solid #2c4a70;}
+    
+    /* Expander */
+    .streamlit-expanderHeader {color: #e6f1ff !important; background-color: #16263b !important;}
 </style>
 """, unsafe_allow_html=True)
 
-# Session State Management
+# Session State
 if 'portfolio' not in st.session_state:
     st.session_state['portfolio'] = []
 
-# Top Bar Configuration (Replaces Sidebar)
+# Top Bar
 with st.expander("Terminal Settings", expanded=False):
     dc_select = st.selectbox("Day Count Convention", ["30/360 (Corporate)", "Actual/365 (Government)"])
     dc_method = "30/360" if "30/360" in dc_select else "Actual/365"
@@ -233,7 +252,6 @@ with tab1:
                     "P&L": s_cln - cln
                 })
             
-            # Professional Table
             df_sim = pd.DataFrame(sim_data)
             st.dataframe(df_sim.style.background_gradient(subset=['P&L'], cmap='RdYlGn'), use_container_width=True)
 
@@ -292,9 +310,21 @@ with tab3:
         y_seq = quant.nss_model(t_seq, b0, b1, b2, tau) * 100
         
         fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(t_seq, y_seq, color='#2c3e50')
+        # Blue Theme Chart Colors
+        fig.patch.set_facecolor('#0c1829')
+        ax.set_facecolor('#0c1829')
+        ax.tick_params(colors='white')
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        ax.title.set_color('white')
+        ax.spines['bottom'].set_color('white')
+        ax.spines['top'].set_color('white')
+        ax.spines['left'].set_color('white')
+        ax.spines['right'].set_color('white')
+        
+        ax.plot(t_seq, y_seq, color='#00e5ff', linewidth=2)
         ax.set_title("Sovereign Yield Curve")
-        ax.grid(True, alpha=0.3)
+        ax.grid(True, alpha=0.2, color='white')
         st.pyplot(fig)
         
         def rf_func(t): return quant.nss_model(t, b0, b1, b2, tau)
@@ -332,7 +362,20 @@ with tab4:
                 rates[:,t] = rates[:,t-1] + dr
                 
             fig_mc, ax_mc = plt.subplots(figsize=(10, 4))
-            ax_mc.plot(np.linspace(0, T, N), rates.T, alpha=0.1, color='blue')
-            ax_mc.plot(np.linspace(0, T, N), rates.mean(axis=0), color='black', linewidth=2)
+            
+            # Blue Theme Chart Colors
+            fig_mc.patch.set_facecolor('#0c1829')
+            ax_mc.set_facecolor('#0c1829')
+            ax_mc.tick_params(colors='white')
+            ax_mc.xaxis.label.set_color('white')
+            ax_mc.yaxis.label.set_color('white')
+            ax_mc.title.set_color('white')
+            ax_mc.spines['bottom'].set_color('white')
+            ax_mc.spines['top'].set_color('white')
+            ax_mc.spines['left'].set_color('white')
+            ax_mc.spines['right'].set_color('white')
+
+            ax_mc.plot(np.linspace(0, T, N), rates.T, alpha=0.1, color='#00e5ff')
+            ax_mc.plot(np.linspace(0, T, N), rates.mean(axis=0), color='white', linewidth=2)
             ax_mc.set_title("Interest Rate Paths")
             st.pyplot(fig_mc)
