@@ -2,235 +2,256 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
+import datetime
 
 # ==========================================
-# 🧠 FRIDAY'S FINANCIAL ENGINE (BACKEND)
+# 🧠 FRIDAY'S INDIA FINANCIAL ENGINE
 # ==========================================
-class BondAnalytics:
-    def __init__(self, face_value, coupon_rate, years, frequency=1, days_since_last_coupon=0):
+class IndianBondAnalytics:
+    def __init__(self, face_value, coupon_rate, years, frequency, day_count_method="30/360"):
         self.face_value = face_value
         self.coupon_rate = coupon_rate
         self.years = years
         self.frequency = frequency
-        self.days_since = days_since_last_coupon
+        self.day_count_method = day_count_method
         
-        # Standardize time periods
+        # Standardize periods
         self.total_periods = int(self.years * self.frequency)
         self.coupon_amount = (self.face_value * self.coupon_rate) / self.frequency
-        
-        # Calculate Accrued Interest
-        # (Days Since / Days in Period) * Coupon Amount
-        days_in_period = 360 / self.frequency # Standard US Day Count Convention (30/360 approx)
-        self.fraction_period = self.days_since / days_in_period
-        self.accrued_interest = self.fraction_period * self.coupon_amount
 
-    def price_from_yield(self, ytm_percent):
+    def calculate_accrued_interest(self, days_held):
+        """
+        Calculates Accrued Interest based on Indian Day Count Conventions.
+        - 30/360: Standard for Corporate Bonds.
+        - Actual/365: Standard for G-Secs.
+        """
+        if self.day_count_method == "30/360":
+            days_in_year = 360
+        else: # Actual/365 (G-Sec)
+            days_in_year = 365
+            
+        # Accrued = (Days / Days in Year) * (Coupon * Frequency) ? 
+        # Actually simpler: Accrued = (Days Held / Days in Period) * Coupon Payment
+        
+        days_in_period = days_in_year / self.frequency
+        fraction = days_held / days_in_period
+        return fraction * self.coupon_amount, fraction
+
+    def price_from_yield(self, ytm_percent, days_held=0):
         """Calculates CLEAN Price given a YTM."""
         r = ytm_percent / self.frequency
+        accrued_val, fraction_period = self.calculate_accrued_interest(days_held)
         
         # Time remaining for each cash flow
-        # If we are 30 days into a period, the next coupon comes sooner (1 - fraction)
-        time_to_flows = np.arange(1, self.total_periods + 1) - self.fraction_period
-        
-        # Discount Factors
-        discount_factors = (1 + r) ** -time_to_flows
+        # If we held for 30 days, next coupon is closer.
+        time_to_flows = np.arange(1, self.total_periods + 1) - fraction_period
         
         # Cash Flows
         cash_flows = np.full(self.total_periods, self.coupon_amount)
         cash_flows[-1] += self.face_value
         
-        # Dirty Price (Present Value of all future cash flows)
-        dirty_price = np.sum(cash_flows * discount_factors)
+        # Dirty Price (PV of future cash flows)
+        dirty_price = np.sum(cash_flows * ((1 + r) ** -time_to_flows))
         
-        # Clean Price = Dirty Price - Accrued Interest
-        clean_price = dirty_price - self.accrued_interest
-        return clean_price, dirty_price
+        # Clean Price = Dirty - Accrued
+        clean_price = dirty_price - accrued_val
+        return clean_price, dirty_price, accrued_val
 
-    def yield_from_price(self, market_clean_price):
-        """
-        Solves for YTM given a Market Price using Newton-Raphson method.
-        This effectively 'reverse engineers' the bond.
-        """
-        # Initial guess (Coupon Rate is usually a good starting point)
+    def yield_from_price(self, market_clean_price, days_held=0):
+        """Solves for YTM (XIRR equivalent) given a Market Price."""
         guess = self.coupon_rate
-        tolerance = 1e-6
-        max_iter = 100
-        
-        for _ in range(max_iter):
-            price_est, _ = self.price_from_yield(guess)
+        for _ in range(50): # Newton-Raphson limit
+            price_est, _, _ = self.price_from_yield(guess, days_held)
             diff = price_est - market_clean_price
+            if abs(diff) < 1e-6: return guess
             
-            if abs(diff) < tolerance:
-                return guess
-            
-            # Derivative approx (small shock) to find slope
-            shock_price, _ = self.price_from_yield(guess + 0.0001)
+            # Derivative
+            shock_price, _, _ = self.price_from_yield(guess + 0.0001, days_held)
             derivative = (shock_price - price_est) / 0.0001
-            
-            # Newton Step
             guess = guess - (diff / derivative)
-            
-        return guess # Return best guess if not converged
-
-    def get_risk_metrics(self, ytm):
-        """Calculates Duration and Convexity based on the YTM."""
-        clean, dirty = self.price_from_yield(ytm)
-        r = ytm / self.frequency
-        
-        # Cash Flow Arrays
-        time_to_flows = np.arange(1, self.total_periods + 1) - self.fraction_period
-        cash_flows = np.full(self.total_periods, self.coupon_amount)
-        cash_flows[-1] += self.face_value
-        
-        pv_flows = cash_flows * ((1 + r) ** -time_to_flows)
-        
-        # Macaulay Duration (Weighted Average Time)
-        # Sum( Time * PV ) / Total Price
-        mac_duration = np.sum(time_to_flows * pv_flows) / dirty
-        mac_duration_years = mac_duration / self.frequency
-        
-        # Modified Duration
-        mod_duration = mac_duration_years / (1 + r)
-        
-        # Convexity
-        # Sum ( CF / (1+y)^t * (t^2+t) )
-        # Simplified approximate calculation for code robustness
-        convexity_term = np.sum(pv_flows * (time_to_flows ** 2 + time_to_flows))
-        convexity = convexity_term / (dirty * (1 + r)**2 * self.frequency**2)
-        
-        return mod_duration, convexity, mac_duration_years
+        return guess
 
 # ==========================================
-# 🖥️ STREAMLIT UI (FRONTEND)
+# 🇮🇳 UI CONFIGURATION (No Sidebar)
 # ==========================================
-st.set_page_config(page_title="Friday's Master Terminal", layout="wide", page_icon="🏦")
+st.set_page_config(page_title="Friday's India Bond Terminal", layout="wide", page_icon="🇮🇳")
 
-# Custom Styling
+# CSS for "Clean Professional" Look
 st.markdown("""
 <style>
-    .metric-container {background-color: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 5px solid #2e86de; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);}
-    .highlight {color: #2e86de; font-weight: bold;}
-    .big-num {font-size: 28px; font-weight: bold; color: #333;}
-    .sub-text {font-size: 14px; color: #666;}
+    /* Remove Sidebar spacing */
+    .css-1d391kg {padding-top: 0rem;}
+    
+    /* Metrics Styling */
+    .metric-card {
+        background-color: #ffffff;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 15px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        text-align: center;
+    }
+    .big-font {font-size: 20px; font-weight: 600; color: #1a73e8;}
+    
+    /* Section Headers */
+    .section-head {
+        font-size: 18px; 
+        font-weight: bold; 
+        color: #333; 
+        border-bottom: 2px solid #FF9933; /* Saffron color */
+        padding-bottom: 5px;
+        margin-top: 20px;
+        margin-bottom: 15px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🏦 Institutional Bond Pricing Terminal")
-st.markdown("Advanced analytics including **Accrued Interest**, **Implied Yield Solving**, and **Risk Matrices**.")
+# --- HEADER ---
+c_head1, c_head2 = st.columns([3, 1])
+with c_head1:
+    st.title("🇮🇳 India Fixed Income Terminal")
+    st.caption("Advanced Analytics for G-Secs, SDLs, and Corporate Bonds.")
+with c_head2:
+    st.image("https://upload.wikimedia.org/wikipedia/en/4/41/Flag_of_India.svg", width=60)
 
-# --- SIDEBAR: GLOBAL SETTINGS ---
-with st.sidebar:
-    st.header("1. Bond Contract Specs")
-    fv = st.number_input("Face Value ($)", value=1000, step=100)
-    cr = st.number_input("Annual Coupon Rate (%)", value=5.0, step=0.1) / 100
-    mat = st.number_input("Years to Maturity", value=10.0, step=0.5)
-    freq = st.selectbox("Payment Frequency", [1, 2], format_func=lambda x: "Annual" if x==1 else "Semi-Annual")
+# --- 1. TOP RIBBON: BOND INPUTS ---
+st.markdown('<div class="section-head">1. Security Definition (Face Value & Coupon)</div>', unsafe_allow_html=True)
+
+with st.container():
+    col1, col2, col3, col4, col5 = st.columns(5)
     
-    st.markdown("---")
-    st.header("2. Transaction Date")
-    days_since = st.number_input("Days Since Last Coupon", min_value=0, max_value=int(360/freq)-1, value=0,
-                                help="Used to calculate Accrued Interest (Dirty Price).")
+    with col1:
+        bond_type = st.selectbox("Bond Type", ["Corporate Bond", "Govt Security (G-Sec)"])
+        # Auto-select day count based on type
+        dc_method = "Actual/365" if "Govt" in bond_type else "30/360"
+        
+    with col2:
+        fv = st.number_input("Face Value (₹)", value=1000, step=100, help="Usually ₹1,000 for Retail, ₹10 Lakhs for Private.")
     
-    st.markdown("---")
-    st.info("💡 **Friday's Tip:** 'Clean Price' is what you see quoted. 'Dirty Price' is what you actually pay.")
+    with col3:
+        cr = st.number_input("Coupon Rate (%)", value=7.50, step=0.10) / 100
+        
+    with col4:
+        mat = st.number_input("Years to Maturity", value=5.0, step=0.5)
+        
+    with col5:
+        freq = st.selectbox("Frequency", [1, 2], format_func=lambda x: "Annual" if x==1 else "Semi-Annual")
 
 # Initialize Engine
-bond = BondAnalytics(fv, cr, mat, freq, days_since)
+bond = IndianBondAnalytics(fv, cr, mat, freq, dc_method)
 
-# --- MODE SELECTION ---
-mode = st.radio("Select Analysis Mode:", ["Calculate Price (from Yield)", "Calculate Yield (from Price)"], horizontal=True)
+# --- 2. MARKET DATA & CALCULATIONS ---
+st.markdown(f'<div class="section-head">2. Market Valuation (Day Count: {dc_method})</div>', unsafe_allow_html=True)
 
-st.markdown("---")
+# Layout: Left side (Controls), Right side (Results)
+c_left, c_right = st.columns([1, 2])
 
-# ==========================================
-# 📊 MAIN LOGIC BRANCHING
-# ==========================================
-
-final_ytm = 0.0
-final_clean_price = 0.0
-
-if mode == "Calculate Price (from Yield)":
-    # INPUT: Yield -> OUTPUT: Price
-    col_in, col_res = st.columns([1, 2])
-    with col_in:
-        user_ytm = st.number_input("Enter Market Yield (YTM %)", value=4.0, step=0.01) / 100
+with c_left:
+    st.info("👇 **Enter Market Data Here**")
+    
+    # Toggle Calculation Mode
+    calc_mode = st.radio("I want to calculate:", ["Fair Price (from Yield)", "Implied Yield (from Price)"], horizontal=True)
+    
+    st.markdown("---")
+    
+    days_held = st.slider("Days Since Last Coupon", 0, 180, 0, help="Used for Accrued Interest calculation.")
+    
+    final_ytm = 0.0
+    final_clean = 0.0
+    
+    if "Price" in calc_mode:
+        user_ytm = st.number_input("Market Yield (YTM %)", value=7.20, step=0.05) / 100
         final_ytm = user_ytm
-        final_clean_price, dirty_price = bond.price_from_yield(final_ytm)
-        
-    with col_res:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Clean Price (Quote)", f"${final_clean_price:,.2f}")
-        c2.metric("Accrued Interest", f"+ ${bond.accrued_interest:,.2f}")
-        c3.metric("Invoice Price (Dirty)", f"${dirty_price:,.2f}", delta="Amount to Pay")
+        final_clean, dirty, accrued = bond.price_from_yield(final_ytm, days_held)
+    else:
+        user_price = st.number_input("Clean Market Price (₹)", value=1005.00, step=1.0)
+        final_clean = user_price
+        final_ytm = bond.yield_from_price(final_clean, days_held)
+        _, dirty, accrued = bond.price_from_yield(final_ytm, days_held)
 
-else:
-    # INPUT: Price -> OUTPUT: Yield
-    col_in, col_res = st.columns([1, 2])
-    with col_in:
-        user_price = st.number_input("Enter Market Price ($)", value=1050.0, step=10.0)
-        final_clean_price = user_price
-        
-        # Run Solver
-        final_ytm = bond.yield_from_price(final_clean_price)
-        _, dirty_price = bond.price_from_yield(final_ytm)
-        
-    with col_res:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Implied YTM (Yield)", f"{final_ytm*100:.3f}%", delta="Annual Return")
-        c2.metric("Accrued Interest", f"${bond.accrued_interest:,.2f}")
-        c3.metric("Invoice Price (Dirty)", f"${dirty_price:,.2f}")
-
-# ==========================================
-# 📉 RISK & SENSITIVITY ANALYSIS
-# ==========================================
-st.subheader("Risk Analytics")
-
-mod_d, conv, mac_d = bond.get_risk_metrics(final_ytm)
-
-# Risk Cards
-r1, r2, r3, r4 = st.columns(4)
-r1.info(f"**Modified Duration:** {mod_d:.2f}\n\n(1% Rate Hike = {mod_d:.2f}% Price Drop)")
-r2.info(f"**Convexity:** {conv:.2f}\n\n(Curvature Adjustment)")
-r3.info(f"**Macaulay Duration:** {mac_d:.2f} Yrs\n\n(Time to recover capital)")
-r4.info(f"**DV01:** ${mod_d * final_clean_price * 0.0001:,.3f}\n\n(Value of 1 basis point)")
-
-# --- SENSITIVITY MATRIX ---
-st.markdown("### Sensitivity Matrix (Price Scenarios)")
-with st.expander("Open Price Scenario Table", expanded=True):
-    # Create a range of Yields (+/- 1%)
-    base_bps = final_ytm * 10000
-    scenarios = [-100, -50, -25, 0, 25, 50, 100]
+with c_right:
+    # RESULT CARDS
+    rc1, rc2, rc3 = st.columns(3)
     
-    matrix_data = []
-    for s in scenarios:
-        test_y = (base_bps + s) / 10000
-        p, _ = bond.price_from_yield(test_y)
-        change_pct = (p - final_clean_price) / final_clean_price * 100
-        matrix_data.append({
-            "Shift (bps)": f"{s:+}",
-            "New Yield": f"{test_y*100:.3f}%",
-            "Est. Price": f"${p:,.2f}",
-            "% Change": f"{change_pct:+.2f}%",
-            "P/L ($)": f"${p - final_clean_price:,.2f}"
-        })
+    with rc1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color: #666; font-size: 14px;">Clean Price (Quote)</div>
+            <div style="font-size: 26px; font-weight: bold; color: #2c3e50;">₹{final_clean:,.2f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with rc2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color: #666; font-size: 14px;">Accrued Interest</div>
+            <div style="font-size: 26px; font-weight: bold; color: #27ae60;">+ ₹{accrued:,.2f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with rc3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color: #666; font-size: 14px;">Total Invoice Price</div>
+            <div style="font-size: 26px; font-weight: bold; color: #c0392b;">₹{dirty:,.2f}</div>
+            <div style="font-size: 12px;">(What you pay)</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Secondary Metrics Line
+    st.write("") # Spacer
+    sm1, sm2, sm3 = st.columns(3)
+    sm1.metric("Yield to Maturity (YTM)", f"{final_ytm*100:.3f}%")
     
-    st.table(pd.DataFrame(matrix_data).set_index("Shift (bps)"))
+    # Quick Check
+    if final_clean < fv:
+        sm2.warning(f"Discount Bond (Cheap)")
+    elif final_clean > fv:
+        sm2.success(f"Premium Bond (Expensive)")
+    else:
+        sm2.info("Par Bond")
 
-# --- VISUALIZATION ---
-st.markdown("### Price-Yield Curve Analysis")
-fig, ax = plt.subplots(figsize=(10, 4))
-y_range = np.linspace(max(0.001, final_ytm-0.03), final_ytm+0.03, 100)
-p_curve = [bond.price_from_yield(y)[0] for y in y_range]
+# --- 3. CHARTS & SENSITIVITY ---
+st.markdown('<div class="section-head">3. Analysis & Scenarios</div>', unsafe_allow_html=True)
 
-ax.plot(y_range*100, p_curve, color="#2e86de", linewidth=2, label="Price Curve")
-ax.scatter([final_ytm*100], [final_clean_price], color="red", s=100, zorder=5, label="Current Bond")
+tab1, tab2 = st.tabs(["📈 Sensitivity Graph", "🚨 Stress Test Matrix"])
 
-# Annotations
-ax.set_title("Bond Price vs Market Yield", fontsize=12)
-ax.set_xlabel("Yield (%)")
-ax.set_ylabel("Clean Price ($)")
-ax.grid(True, linestyle=":", alpha=0.6)
-ax.legend()
+with tab1:
+    # Plotting Price vs Yield
+    fig, ax = plt.subplots(figsize=(10, 3))
+    
+    # Generate range around current YTM
+    y_range = np.linspace(max(0.01, final_ytm - 0.02), final_ytm + 0.02, 50)
+    prices = [bond.price_from_yield(y, days_held)[0] for y in y_range]
+    
+    ax.plot(y_range*100, prices, color="#1a73e8", linewidth=2.5)
+    ax.scatter([final_ytm*100], [final_clean], color="#e74c3c", s=100, zorder=5, label="Current Position")
+    
+    # Styling
+    ax.set_title("Price Sensitivity to Interest Rates", fontsize=10)
+    ax.set_xlabel("Yield (%)")
+    ax.set_ylabel("Price (₹)")
+    ax.grid(True, linestyle=":", alpha=0.5)
+    ax.legend()
+    
+    # Remove top and right spines for clean look
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    st.pyplot(fig)
 
-st.pyplot(fig)
+with tab2:
+    st.write("How does the price change if RBI changes rates?")
+    
+    # Horizontal Scenario Table
+    scenarios = [-0.50, -0.25, 0.0, +0.25, +0.50]
+    cols = st.columns(len(scenarios))
+    
+    for i, shock in enumerate(scenarios):
+        new_y = final_ytm + (shock / 100)
+        new_p, _, _ = bond.price_from_yield(new_y, days_held)
+        diff = new_p - final_clean
+        color = "green" if diff > 0 else "red"
+        
+        with cols[i]:
+            st.metric(f"Rate {shock:+.2f}%", f"₹{new_p:,.0f}", f"{diff:+.0f}", delta_color="normal")
