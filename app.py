@@ -2,323 +2,298 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
-from dateutil.relativedelta import relativedelta
 import matplotlib.pyplot as plt
+from scipy.optimize import newton, minimize
 
 # ==========================================
-# 🧠 FRIDAY'S "DATE-AWARE" ENGINE (Fixed Logic)
+# 🧠 CORE QUANT ENGINE (The "Brain")
 # ==========================================
-class IndianBondEngine:
-    def __init__(self, face_value, coupon_rate, maturity_date, settlement_date, frequency, day_count="30/360"):
-        self.face_value = face_value
-        self.coupon_rate = coupon_rate
-        self.maturity_date = maturity_date
-        self.settlement_date = settlement_date
-        self.frequency = frequency
-        self.day_count_method = day_count
-        
-        # Derived basics
-        self.coupon_amt_per_period = (self.face_value * self.coupon_rate) / self.frequency
 
-    def _days_between(self, d1, d2):
-        """Calculates days based on convention."""
-        if self.day_count_method == "30/360":
-            # Indian Corporate / Standard 30/360 NASD logic
-            d1_day = min(30, d1.day)
-            d2_day = min(30, d2.day) if d1_day == 30 else d2.day
-            return (d2.year - d1.year) * 360 + (d2.month - d1.month) * 30 + (d2_day - d1_day)
-        else:
-            # Actual/365 or Actual/Actual (G-Sec simplified)
-            return (d2 - d1).days
+class IndianBondQuant:
+    """
+    Institutional Grade Engine for Indian Fixed Income.
+    Conventions:
+    - Day Count: 30/360 (Standard for India G-Sec & Corp)
+    - Settlement: T+1 (Standard RBI/CCIL)
+    """
+    def __init__(self, face_value=100, freq=2):
+        self.fv = face_value
+        self.freq = freq
 
-    def get_coupon_schedule(self):
-        """Generates all FUTURE coupon dates from Settlement to Maturity."""
-        if self.settlement_date >= self.maturity_date:
-            return []
+    @staticmethod
+    def day_count_30_360(start_date, end_date):
+        """Standard 30/360 Day count convention."""
+        d1 = min(30, start_date.day)
+        d2 = min(30, end_date.day) if d1 == 30 else end_date.day
+        return 360 * (end_date.year - start_date.year) + 30 * (end_date.month - start_date.month) + (d2 - d1)
 
-        # 1. Backtrack from Maturity Date to find all coupon dates
-        # We go backwards to ensure the Maturity Date is a coupon date
+    def get_cash_flows(self, maturity_date, settle_date, coupon_rate):
+        """Generates cash flow dates and amounts."""
         dates = []
-        current_date = self.maturity_date
+        curr = maturity_date
+        # Backtrack from maturity
+        while curr > settle_date:
+            dates.append(curr)
+            # Approx 6 months back
+            curr = curr - datetime.timedelta(days=365//self.freq)
         
-        # Step back in months (12/freq) until we pass the settlement date
-        months_step = int(12 / self.frequency)
+        dates.sort()
         
-        while current_date > self.settlement_date:
-            dates.append(current_date)
-            current_date = current_date - relativedelta(months=months_step)
-        
-        # The list is [Maturity, Mat-6m, Mat-12m...]. Reverse it to be chronological.
-        dates.reverse()
-        return dates
+        cf_amt = (self.fv * coupon_rate) / self.freq
+        flows = []
+        for i, d in enumerate(dates):
+            amt = cf_amt
+            if i == len(dates) - 1:
+                amt += self.fv
+            
+            # Time in years (30/360 basis)
+            days = self.day_count_30_360(settle_date, d)
+            t = days / 360.0
+            flows.append({'date': d, 't': t, 'cf': amt})
+            
+        return pd.DataFrame(flows)
 
-    def calculate_metrics(self, ytm_percent):
-        """Calculates Dirty Price, Clean Price, and Accrued Interest using Date Logic."""
-        future_dates = self.get_coupon_schedule()
-        
-        if not future_dates:
-            return 0.0, 0.0, 0.0, pd.DataFrame()
+    def price_bond(self, flows, ytm):
+        """Prices bond using precise discount factors."""
+        # PV = CF / (1 + y/f)^(t*f)
+        flows['df'] = 1 / ((1 + ytm/self.freq) ** (flows['t'] * self.freq))
+        flows['pv'] = flows['cf'] * flows['df']
+        return flows['pv'].sum()
 
-        # 1. Identify Coupon Boundaries
-        next_coupon_date = future_dates[0]
-        months_step = int(12 / self.frequency)
-        prev_coupon_date = next_coupon_date - relativedelta(months=months_step)
+    def calculate_risk_metrics(self, flows, ytm, price):
+        """Calculates Duration, Convexity, and PV01."""
+        # Modified Duration
+        # MacDur = Sum(t * PV) / Price
+        mac_num = (flows['t'] * flows['pv']).sum()
+        mac_dur = mac_num / price
+        mod_dur = mac_dur / (1 + ytm/self.freq)
         
-        # 2. Calculate Accrued Interest Fractions
-        # Fraction = (Settlement - Prev) / (Next - Prev)
-        days_accrued = self._days_between(prev_coupon_date, self.settlement_date)
-        days_in_period = self._days_between(prev_coupon_date, next_coupon_date)
+        # Convexity
+        # Conv = (1 / P) * Sum( CF / (1+y)^(t+2) * (t^2 + t) ) ... simplified approx
+        # Using centered difference for robustness:
+        # (P_down + P_up - 2P) / (P * (dy)^2)
+        dy = 0.0001 # 1 bp
+        p_up = self.price_bond(flows, ytm + dy)
+        p_down = self.price_bond(flows, ytm - dy)
+        convexity = (p_down + p_up - 2 * price) / (price * dy**2)
         
-        # Safety for division by zero or negative dates
-        if days_in_period <= 0: days_in_period = 180 # Fallback
+        # PV01 (Price Value of 1 bp change) per 100 face value
+        pv01 = (p_down - p_up) / 2
         
-        fraction_accumulated = days_accrued / days_in_period
-        accrued_interest = fraction_accumulated * self.coupon_amt_per_period
+        return mod_dur, convexity, pv01
 
-        # 3. Discounting Cash Flows
-        # We discount to the SETTLEMENT date.
-        # Time (t) for specific cash flow = (Date - Settlement) / 365 (or 360)
-        
-        df_data = []
-        dirty_price = 0.0
-        
-        # Determine year denominator for discounting (usually market uses Act/365 for Yield)
-        year_base = 360.0 if self.day_count_method == "30/360" else 365.0
-        
-        for i, date in enumerate(future_dates):
-            # Cash Flow is Coupon, plus Face Value if it's the last date
-            cf = self.coupon_amt_per_period
-            if i == len(future_dates) - 1:
-                cf += self.face_value
-            
-            # Time in years from settlement
-            days_from_settle = self._days_between(self.settlement_date, date)
-            t_years = days_from_settle / year_base
-            
-            # PV Calculation
-            # Standard Street Convention: PV = CF / (1 + YTM/freq)^(n - fraction + i)
-            # But let's use continuous compounding or standard annual periods for clarity in generic tool
-            # Using: PV = CF / (1 + YTM)^t
-            
-            pv = cf / ((1 + ytm_percent) ** t_years)
-            dirty_price += pv
-            
-            df_data.append({
-                "Date": date,
-                "Days Away": days_from_settle,
-                "Cash Flow": cf,
-                "PV Factor": 1 / ((1 + ytm_percent) ** t_years),
-                "PV": pv
-            })
-            
-        clean_price = dirty_price - accrued_interest
-        
-        return clean_price, dirty_price, accrued_interest, pd.DataFrame(df_data)
+    def z_spread_solver(self, flows, market_price, risk_free_curve_func):
+        """
+        Calculates Z-Spread (Credit Spread) over a risk-free curve.
+        Z-Spread is the constant spread 'z' added to the yield curve to match market price.
+        """
+        def objective(z):
+            # Discount each cash flow by (RiskFreeRate(t) + z)
+            # PV = Sum [ CF_i / (1 + r_i + z)^t_i ] -- Simplified for continuous or annual
+            # Using discrete compounding match:
+            pv_sum = 0
+            for _, row in flows.iterrows():
+                r_t = risk_free_curve_func(row['t']) # Get G-Sec rate for this maturity
+                discount_rate = r_t + z
+                pv_sum += row['cf'] / ((1 + discount_rate/self.freq) ** (row['t'] * self.freq))
+            return pv_sum - market_price
 
-    def yield_solver(self, target_clean_price):
-        """Solves for YTM given a Clean Price."""
-        # Simple bisection search (more robust than Newton for generic dates)
-        low = 0.0001
-        high = 1.00 # 100%
-        for _ in range(50):
-            mid = (low + high) / 2
-            p, _, _, _ = self.calculate_metrics(mid)
-            if abs(p - target_clean_price) < 0.01:
-                return mid
-            if p > target_clean_price:
-                low = mid # Need higher yield to lower price
-            else:
-                high = mid
-        return (low + high) / 2
+        try:
+            # Solve for z where objective(z) == 0
+            z_spread = newton(objective, 0.01) # Start guess 1%
+            return z_spread
+        except:
+            return 0.0
 
 # ==========================================
-# 🇮🇳 UI CONFIGURATION (Beautified)
+# 🎲 SIMULATION ENGINE (Vasicek Model)
 # ==========================================
-st.set_page_config(page_title="Friday's Pro Terminal", layout="wide", page_icon="📈")
+def vasicek_simulation(r0, kappa, theta, sigma, T=1, dt=1/252, paths=100):
+    """
+    Simulates Interest Rate Paths using Vasicek Model.
+    dr_t = kappa * (theta - r_t) * dt + sigma * dW_t
+    """
+    N = int(T / dt)
+    rates = np.zeros((paths, N))
+    rates[:, 0] = r0
+    
+    for t in range(1, N):
+        # Euler-Maruyama discretization
+        dr = kappa * (theta - rates[:, t-1]) * dt + sigma * np.sqrt(dt) * np.random.normal(0, 1, paths)
+        rates[:, t] = rates[:, t-1] + dr
+        
+    return rates
 
-# CSS for a High-End Fintech Look
+# ==========================================
+# 🖥️ FRIDAY TERMINAL UI
+# ==========================================
+st.set_page_config(page_title="Friday Terminal", layout="wide", page_icon="💹")
+
+# Custom CSS for "Terminal" Feel
 st.markdown("""
 <style>
-    /* Global Background */
-    .stApp {background-color: #f8f9fa;}
-    
-    /* Header Styling */
-    h1 {color: #0f2c4a; font-family: 'Helvetica Neue', sans-serif;}
-    .stMarkdown h3 {color: #444;}
-    
-    /* Input Cards */
-    .input-card {
-        background-color: white; 
-        padding: 20px; 
-        border-radius: 12px; 
-        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-        border-left: 5px solid #ff9f43;
-    }
-    
-    /* Result Cards */
-    .result-metric {
-        background: linear-gradient(135deg, #ffffff 0%, #f1f2f6 100%);
-        border: 1px solid #dcdde1;
-        padding: 15px;
-        border-radius: 10px;
-        text-align: center;
-        box-shadow: 2px 2px 8px rgba(0,0,0,0.05);
-    }
-    .metric-value {font-size: 28px; font-weight: 700; color: #2f3542;}
-    .metric-label {font-size: 14px; color: #747d8c; text-transform: uppercase; letter-spacing: 1px;}
-    
-    /* Table Styling */
-    thead tr th:first-child {display:none}
-    tbody th {display:none}
+    .main {background-color: #0e1117;}
+    h1, h2, h3 {color: #e0e0e0; font-family: 'Roboto Mono', monospace;}
+    .stMetric {background-color: #1f2937; padding: 10px; border-radius: 5px; border: 1px solid #374151;}
+    .stDataFrame {border: 1px solid #374151;}
+    div[data-testid="stSidebar"] {background-color: #111827;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- HEADER ---
-col_h1, col_h2 = st.columns([4, 1])
-with col_h1:
-    st.title("🇮🇳 India Fixed Income Analytics")
-    st.caption("Professional Date-Aware Valuation (RBI / SEBI Standards)")
-with col_h2:
-    st.markdown("## 🗓️ " + datetime.date.today().strftime("%d %b %Y"))
+st.title("💹 Friday Fixed Income Terminal")
+st.caption("Institutional Analytics | RBI Conventions | Credit Modeling")
 
-st.markdown("---")
-
-# --- 1. CONFIGURATION PANEL (Top Ribbon) ---
-with st.container():
-    # We use a container with a white background effect via CSS potential or just Streamlit columns
-    c1, c2, c3, c4 = st.columns(4)
-    
-    with c1:
-        st.subheader("1. Bond Specs")
-        fv = st.number_input("Face Value (₹)", 1000, step=100)
-        cr = st.number_input("Coupon Rate (%)", value=7.50, step=0.1) / 100
-        freq = st.selectbox("Frequency", [1, 2], format_func=lambda x: "Annual" if x==1 else "Semi-Annual")
-
-    with c2:
-        st.subheader("2. Dates")
-        # Logic: Bond usually matures 5 years from now
-        default_mat = datetime.date.today() + relativedelta(years=5)
-        mat_date = st.date_input("Maturity Date", value=default_mat)
-        
-        settle_date = st.date_input("Settlement Date", value=datetime.date.today())
-
-    with c3:
-        st.subheader("3. Convention")
-        bond_type = st.radio("Market Standard", ["G-Sec (Act/365)", "Corporate (30/360)"])
-        dc_method = "Actual/365" if "G-Sec" in bond_type else "30/360"
-        
-    with c4:
-        st.subheader("4. Mode")
-        calc_mode = st.radio("Solver Mode", ["Price from Yield", "Yield from Price"])
+# --- NAVIGATION ---
+page = st.sidebar.radio("Navigate Module", ["1. Pricing & Risk", "2. Curve & Credit", "3. Monte Carlo Sim"])
 
 # Initialize Engine
-engine = IndianBondEngine(fv, cr, mat_date, settle_date, freq, dc_method)
+quant = IndianBondQuant(face_value=100, freq=2)
 
-st.markdown("<br>", unsafe_allow_html=True)
-
-# --- 2. MAIN CALCULATION BLOCK ---
-
-# Variables to hold results
-final_clean = 0.0
-final_dirty = 0.0
-final_accrued = 0.0
-final_ytm = 0.0
-schedule_df = pd.DataFrame()
-
-# Perform Calculations based on Mode
-if "Price from Yield" in calc_mode:
-    # Input YTM -> Get Price
+# ==========================================
+# PAGE 1: PRICING & RISK (The Deal Desk)
+# ==========================================
+if page == "1. Pricing & Risk":
+    st.header("1. Deal Desk: Pricing & Sensitivities")
+    
     col_in, col_out = st.columns([1, 2])
+    
     with col_in:
-        st.markdown('<div class="input-card">', unsafe_allow_html=True)
-        user_ytm = st.number_input("📉 Input Market Yield (YTM %)", value=7.25, step=0.05) / 100
-        st.markdown('</div>', unsafe_allow_html=True)
-        final_ytm = user_ytm
-        final_clean, final_dirty, final_accrued, schedule_df = engine.calculate_metrics(final_ytm)
+        with st.expander("Security Definition", expanded=True):
+            cr = st.number_input("Coupon Rate (%)", 7.00, step=0.1) / 100
+            mat_date = st.date_input("Maturity", datetime.date.today() + datetime.timedelta(days=3650))
+            ytm = st.number_input("Market YTM (%)", 7.20, step=0.01) / 100
         
-else:
-    # Input Price -> Get Yield
-    col_in, col_out = st.columns([1, 2])
-    with col_in:
-        st.markdown('<div class="input-card">', unsafe_allow_html=True)
-        user_price = st.number_input("💰 Input Clean Price (₹)", value=1005.00, step=0.50)
-        st.markdown('</div>', unsafe_allow_html=True)
-        final_clean = user_price
-        final_ytm = engine.yield_solver(final_clean)
-        final_clean, final_dirty, final_accrued, schedule_df = engine.calculate_metrics(final_ytm)
+        st.info("Settlement: T+1 (Standard)")
+        settle_date = datetime.date.today() + datetime.timedelta(days=1)
 
-# --- 3. DISPLAY RESULTS (Full Width) ---
-
-if not schedule_df.empty:
+    # Calculation
+    flows = quant.get_cash_flows(mat_date, settle_date, cr)
+    price = quant.price_bond(flows, ytm)
+    mod_dur, conv, pv01 = quant.calculate_risk_metrics(flows, ytm, price)
+    
     with col_out:
-        # Using custom HTML for cards to ensure they look "Beautified"
-        rc1, rc2, rc3 = st.columns(3)
+        # Top Line Metrics
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Clean Price", f"₹{price:.3f}")
+        m2.metric("Mod. Duration", f"{mod_dur:.2f}", help="% Change in price for 1% change in yield")
+        m3.metric("Convexity", f"{conv:.2f}", help="Curvature of price-yield relationship")
+        m4.metric("PV01 (Risk)", f"₹{pv01:.3f}", help="Rupee value lost if rates rise 1 bp (0.01%)")
         
-        with rc1:
-            st.markdown(f"""
-            <div class="result-metric">
-                <div class="metric-label">Clean Price (Quote)</div>
-                <div class="metric-value" style="color:#2980b9">₹{final_clean:,.2f}</div>
-            </div>
-            """, unsafe_allow_html=True)
+        # Scenario Analysis Table (Stress Test)
+        st.subheader("Scenario Matrix")
+        shocks = [-100, -50, -25, 0, 25, 50, 100] # bps
+        res_data = []
+        for s in shocks:
+            shock_y = ytm + (s/10000)
+            p_shock = quant.price_bond(flows, shock_y)
+            p_change = p_shock - price
+            res_data.append({
+                "Shock (bps)": s, 
+                "New Yield": f"{shock_y*100:.2f}%", 
+                "Est. Price": f"{p_shock:.2f}",
+                "P&L (per 100)": p_change
+            })
+        
+        df_res = pd.DataFrame(res_data)
+        
+        # Highlight logic for dataframe
+        def color_pnl(val):
+            color = '#ff4b4b' if val < 0 else '#00cc66'
+            return f'color: {color}'
             
-        with rc2:
-            st.markdown(f"""
-            <div class="result-metric">
-                <div class="metric-label">Accrued Interest</div>
-                <div class="metric-value" style="color:#27ae60">+ ₹{final_accrued:,.2f}</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        with rc3:
-            st.markdown(f"""
-            <div class="result-metric">
-                <div class="metric-label">Invoice Price (Pay)</div>
-                <div class="metric-value" style="color:#c0392b">₹{final_dirty:,.2f}</div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        st.markdown(f"<div style='text-align:center; margin-top:10px; font-weight:bold; color:#555'>Yield to Maturity: {final_ytm*100:.3f}%</div>", unsafe_allow_html=True)
+        st.dataframe(df_res.style.applymap(color_pnl, subset=['P&L (per 100)']), use_container_width=True)
 
-    # --- 4. DETAILS & CASH FLOWS ---
-    st.markdown("---")
+# ==========================================
+# PAGE 2: CURVE & CREDIT (The Analyst)
+# ==========================================
+elif page == "2. Curve & Credit":
+    st.header("2. Credit Spread Analysis")
     
-    tab1, tab2 = st.tabs(["📋 Cash Flow Schedule", "📊 Valuation Analysis"])
+    c1, c2 = st.columns(2)
     
-    with tab1:
-        st.write("This table proves the valuation by discounting every specific future date.")
+    with c1:
+        st.subheader("Bootstrapped G-Sec Curve")
+        st.caption("Theoretical Risk-Free Curve constructed from Benchmarks")
         
-        # Formatting for display
-        display_df = schedule_df.copy()
-        display_df['Date'] = display_df['Date'].apply(lambda x: x.strftime('%d-%b-%Y'))
-        display_df['Cash Flow'] = display_df['Cash Flow'].apply(lambda x: f"₹{x:,.2f}")
-        display_df['PV'] = display_df['PV'].apply(lambda x: f"₹{x:,.2f}")
-        display_df['Days Away'] = display_df['Days Away'].astype(int)
-        display_df['PV Factor'] = display_df['PV Factor'].apply(lambda x: f"{x:.4f}")
+        # Inputs for Curve Construction
+        rates = {
+            1: st.number_input("1Y T-Bill Rate (%)", value=6.50)/100,
+            5: st.number_input("5Y G-Sec Rate (%)", value=7.10)/100,
+            10: st.number_input("10Y G-Sec Rate (%)", value=7.40)/100,
+            30: st.number_input("30Y G-Sec Rate (%)", value=7.80)/100
+        }
         
-        st.table(display_df)
+        # Simple Interpolation Function (Linear for demo)
+        def risk_free_curve(t):
+            years = sorted(rates.keys())
+            vals = [rates[y] for y in years]
+            return np.interp(t, years, vals)
+            
+        # Visualize Curve
+        t_space = np.linspace(0.5, 30, 100)
+        r_space = [risk_free_curve(t)*100 for t in t_space]
         
-    with tab2:
-        c_chart, c_text = st.columns([2, 1])
-        with c_chart:
-            # Simple PV Bar Chart
-            fig, ax = plt.subplots(figsize=(8, 3))
-            ax.bar(schedule_df['Date'], schedule_df['PV'], color='#3498db', width=20)
-            ax.set_title("Present Value of Each Future Payment")
-            ax.set_ylabel("PV (₹)")
-            ax.grid(axis='y', linestyle='--', alpha=0.5)
-            # Format x-axis dates
-            fig.autofmt_xdate()
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.plot(t_space, r_space, color='#00d2d3', lw=2)
+        ax.set_facecolor('#0e1117')
+        fig.patch.set_facecolor('#0e1117')
+        ax.tick_params(colors='white')
+        ax.set_title("Standard Sovereign Yield Curve", color='white')
+        ax.grid(color='#444', linestyle='--')
+        st.pyplot(fig)
+
+    with c2:
+        st.subheader("Z-Spread Solver")
+        st.caption("Calculate credit risk premium over the G-Sec curve.")
+        
+        mp = st.number_input("Corporate Bond Market Price (₹)", value=98.50)
+        cpn = st.number_input("Corporate Coupon (%)", value=8.50) / 100
+        mat = st.date_input("Maturity Date", datetime.date.today() + datetime.timedelta(days=1800))
+        
+        if st.button("Calculate Z-Spread"):
+            settle = datetime.date.today() + datetime.timedelta(days=1)
+            flows = quant.get_cash_flows(mat, settle, cpn)
+            
+            # Solve
+            z = quant.z_spread_solver(flows, mp, risk_free_curve)
+            
+            st.metric("Z-Spread (Credit Premium)", f"{z*10000:.0f} bps", 
+                     delta="Spread over G-Sec")
+            
+            if z > 0.025: # > 250 bps
+                st.warning("⚠️ High Yield / Junk Bond Territory")
+            else:
+                st.success("✅ Investment Grade Territory")
+
+# ==========================================
+# PAGE 3: MONTE CARLO (The Quant)
+# ==========================================
+elif page == "3. Monte Carlo Sim":
+    st.header("3. Stochastic Rate Modeling (Vasicek)")
+    st.markdown("Simulate 1000s of future interest rate paths to stress-test the bond.")
+    
+    col_param, col_sim = st.columns([1, 3])
+    
+    with col_param:
+        st.markdown("**Model Parameters**")
+        r0 = st.number_input("Initial Rate (r0)", 0.07)
+        theta = st.number_input("Long Term Mean (theta)", 0.075)
+        kappa = st.number_input("Mean Reversion Speed (kappa)", 0.5)
+        sigma = st.number_input("Volatility (sigma)", 0.02)
+        
+    with col_sim:
+        if st.button("Run Simulation (100 Paths)"):
+            paths = vasicek_simulation(r0, kappa, theta, sigma, T=5, paths=100)
+            
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot(paths.T, color='#4caf50', alpha=0.1)
+            ax.plot(paths.mean(axis=0), color='white', lw=3, label="Average Path")
+            
+            ax.set_facecolor('#0e1117')
+            fig.patch.set_facecolor('#0e1117')
+            ax.tick_params(colors='white')
+            ax.set_title("Vasicek Short Rate Paths (5 Years)", color='white')
             st.pyplot(fig)
             
-        with c_text:
-            st.info(f"""
-            **Logic Check:**
-            
-            1. **Day Count:** {dc_method}
-            2. **Next Coupon:** {schedule_df['Date'].iloc[0].strftime('%d-%b-%Y')}
-            3. **Days Accrued:** {(schedule_df['Date'].iloc[0] - settle_date).days} days remaining until next coupon.
-            """)
-
-else:
-    st.error("⚠️ Error: Settlement Date cannot be after Maturity Date.")
+            # Pricing based on terminal rates
+            st.success(f"Simulated Volatility Range: {paths[:,-1].min()*100:.2f}% to {paths[:,-1].max()*100:.2f}%")
